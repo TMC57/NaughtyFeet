@@ -1,0 +1,775 @@
+"""
+Générateur de PDF pour les rapports de groupe
+Utilise le même template que les rapports individuels
+"""
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from PIL import Image as PILImage
+from refactored.utils.logger import get_logger
+from refactored.pdf_generator.consumption_charts import ConsumptionChartGenerator
+from refactored.pdf_generator.generator import get_excel_product_name
+from refactored.utils.product_naming import match_group_canonical
+from refactored.services.excel_service import ExcelService
+import unicodedata
+
+logger = get_logger("Group_PDF_Generator")
+
+# Fonction pour normaliser les caractères spéciaux
+def normalize_text(text: str) -> str:
+    """
+    Normalise le texte pour éviter les problèmes d'encodage.
+    Remplace les caractères problématiques par leurs équivalents ASCII.
+    """
+    if not text:
+        return text
+
+    # Supprimer tabulations / retours a la ligne / espaces multiples (carres ■)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # Normaliser les caractères Unicode (décomposer puis recomposer)
+    text = unicodedata.normalize('NFKD', text)
+    
+    # Remplacer les caractères spéciaux courants
+    replacements = {
+        'œ': 'oe',
+        'Œ': 'OE',
+        'æ': 'ae',
+        'Æ': 'AE',
+        '€': 'EUR',
+        '°': ' deg',
+        '…': '...',
+        '–': '-',
+        '—': '-',
+        ''': "'",
+        ''': "'",
+        '"': '"',
+        '"': '"',
+        '«': '"',
+        '»': '"',
+    }
+    
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    
+    # Encoder en ASCII en ignorant les caractères non supportés
+    try:
+        text = text.encode('ascii', 'ignore').decode('ascii')
+    except:
+        pass
+    
+    return text
+
+logger = get_logger("Group_PDF_Generator")
+
+class GroupPDFGenerator:
+    """Générateur de PDF pour les rapports de groupe"""
+    
+    def __init__(self):
+        self.base_dir = Path(__file__).parent.parent
+        self.uploads_dir = self.base_dir / "uploads"
+        self.reports_dir = self.base_dir / "reports"
+        
+    def generate_all_group_pdfs(
+        self,
+        grouped_quantities: Dict[str, Any],
+        grouped_stock: Dict[str, Any],
+        group_configs: List[Dict[str, Any]],
+        from_date: str,
+        to_date: str
+    ) -> List[str]:
+        """
+        Génère tous les PDFs de groupe
+        
+        Returns:
+            Liste des chemins des PDFs générés
+        """
+        generated_pdfs = []
+        
+        # Supprimer le dossier existant pour forcer la régénération
+        output_folder = self.reports_dir / f"group_reports {from_date} to {to_date}"
+        if output_folder.exists():
+            import shutil
+            shutil.rmtree(output_folder)
+            logger.info(f"🗑️ Ancien dossier supprimé: {output_folder}")
+        
+        # Créer un dictionnaire owner -> config pour un accès rapide
+        config_by_owner = {cfg.get("owner"): cfg for cfg in group_configs}
+        
+        # Blacklist de groupes à ne pas générer
+        BLACKLIST = ["GGE", "STA", "Kermovant Automobiles"]
+        
+        # Parcourir tous les owners avec des données
+        for owner_data in grouped_quantities.get("owners", []):
+            owner_name = owner_data.get("owner")
+            
+            # Ignorer les groupes dans la blacklist
+            if owner_name in BLACKLIST:
+                logger.info(f"⏭️  Groupe '{owner_name}' ignoré (blacklist)")
+                continue
+            
+            # Récupérer la config de ce owner
+            owner_config = config_by_owner.get(owner_name, {})
+            
+            # Ignorer les groupes avec "Croix rouge.jpg" (groupes non configurés)
+            cover_picture = owner_config.get("cover_picture", "")
+            if "Croix rouge" in cover_picture:
+                logger.info(f"⏭️  Groupe '{owner_name}' ignoré (pas de photo de couverture)")
+                continue
+            
+            try:
+                # Générer le PDF pour ce groupe
+                pdf_path = self._generate_single_group_pdf(
+                    owner_name,
+                    owner_data,
+                    owner_config,
+                    from_date,
+                    to_date
+                )
+                generated_pdfs.append(pdf_path)
+                logger.success(f"✅ PDF généré pour '{owner_name}': {pdf_path}")
+            except Exception as e:
+                logger.error(f"❌ Erreur lors de la génération du PDF pour '{owner_name}': {e}")
+        
+        return generated_pdfs
+    
+    def _generate_single_group_pdf(
+        self,
+        owner_name: str,
+        owner_data: Dict[str, Any],
+        owner_config: Dict[str, Any],
+        from_date: str,
+        to_date: str
+    ) -> str:
+        """
+        Génère un PDF pour un groupe spécifique
+        """
+        # Créer le dossier de sortie
+        output_folder = self.reports_dir / f"group_reports {from_date} to {to_date}"
+        output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Nom du fichier PDF : Rapports de consommation E-wash_GROUPE Nom du groupe
+        safe_owner_name = owner_name.replace("/", "-").replace("\\", "-")
+        # Ajouter "GROUPE" au début si ce n'est pas déjà présent
+        if not safe_owner_name.upper().startswith("GROUPE"):
+            safe_owner_name = f"GROUPE {safe_owner_name}"
+        pdf_filename = f"Rapports de consommation E-wash_{safe_owner_name}.pdf"
+        pdf_path = output_folder / pdf_filename
+        
+        # Créer le document PDF - MÊME FORMAT QUE LES RAPPORTS INDIVIDUELS (paysage)
+        doc = SimpleDocTemplate(
+            str(pdf_path),
+            pagesize=landscape(A4),
+            leftMargin=0.5*cm,
+            rightMargin=0.5*cm,
+            topMargin=3*cm,
+            bottomMargin=0.8*cm
+        )
+        
+        # Éléments du PDF
+        elements = []
+        
+        # Page de garde
+        self._add_cover_page(elements, owner_name, owner_data, owner_config, from_date, to_date)
+        
+        # Page de graphique de consommation par facility
+        self._add_facility_consumption_chart(elements, owner_name, owner_data, from_date, to_date)
+        
+        # Page de graphique de consommation totale par produit
+        self._add_product_total_chart(elements, owner_name, owner_data, from_date, to_date)
+        
+        # Page des produits livrés (dernière page)
+        self._add_delivered_products_page(elements, owner_name, owner_data, from_date, to_date)
+        
+        # Construire le PDF avec les logos
+        doc.build(elements, onFirstPage=self._draw_first_page, onLaterPages=self._draw_logo)
+        
+        return str(pdf_path)
+    
+    def _add_cover_page(
+        self,
+        elements: List,
+        owner_name: str,
+        owner_data: Dict[str, Any],
+        owner_config: Dict[str, Any],
+        from_date: str,
+        to_date: str
+    ):
+        """
+        Ajoute la page de garde du rapport de groupe
+        Même style que les rapports individuels
+        """
+        styles = getSampleStyleSheet()
+        
+        # Style pour le titre principal - MÊME QUE RAPPORTS INDIVIDUELS
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        from_date_formatted = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        to_date_formatted = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        
+        elements.append(Spacer(1, 0.1*cm))
+        
+        # Titre avec période
+        elements.append(Paragraph(
+            f"RAPPORT DE CONSOMMATION DU {from_date_formatted} AU {to_date_formatted}".upper(),
+            title_style
+        ))
+        elements.append(Spacer(1, 0.2*cm))
+        
+        # Nom du groupe
+        elements.append(Paragraph(owner_name.upper(), title_style))
+        elements.append(Spacer(1, 0.3*cm))
+        
+        # Liste des facilities du groupe avec adresses
+        facilities = owner_data.get("facilities", [])
+        if facilities:
+            # Construire la liste avec nom et adresse
+            facility_entries = []
+            for f in facilities:
+                name = f.get("facilityName", "")
+                address = f.get("address", "")
+                if address:
+                    facility_entries.append(f"<b>{name.upper()}</b> - {address.upper()}")
+                else:
+                    facility_entries.append(f"<b>{name.upper()}</b>")
+            
+            # Séparateur plus visible: " | " en gras et plus gros
+            facilities_text = " <font size='14'><b>|</b></font> ".join(facility_entries)
+            
+            # Style pour la liste des facilities - en gras
+            facilities_style = ParagraphStyle(
+                'FacilitiesList',
+                parent=styles['Normal'],
+                fontName='Helvetica-Bold',
+                fontSize=10,
+                alignment=TA_CENTER,
+                leading=14
+            )
+            elements.append(Paragraph(facilities_text, facilities_style))
+        
+        elements.append(Spacer(1, 0.5*cm))
+        
+        # Photo de couverture
+        cover_picture = owner_config.get("cover_picture", "")
+        if cover_picture and "Croix rouge" not in cover_picture:
+            # Enlever le préfixe /uploads/ si présent
+            if cover_picture.startswith("/uploads/"):
+                cover_picture = cover_picture[9:]
+            
+            cover_path = self.uploads_dir / cover_picture
+            
+            if cover_path.exists():
+                try:
+                    # Charger l'image pour obtenir ses dimensions réelles
+                    with PILImage.open(cover_path) as pil_img:
+                        img_width, img_height = pil_img.size
+                        ratio = img_height / img_width
+                    
+                    # Définir la largeur maximale et calculer la hauteur proportionnelle
+                    max_width = 16*cm
+                    calculated_height = max_width * ratio
+                    
+                    # Limiter la hauteur maximale pour ne pas déborder
+                    max_height = 10*cm
+                    if calculated_height > max_height:
+                        calculated_height = max_height
+                        max_width = calculated_height / ratio
+                    
+                    img = Image(str(cover_path), width=max_width, height=calculated_height)
+                    elements.append(img)
+                except Exception as e:
+                    logger.warning(f"Impossible de charger l'image de couverture: {e}")
+            else:
+                logger.warning(f"Image de couverture introuvable: {cover_path}")
+    
+    def _draw_first_page(self, canvas, doc):
+        """Dessine les logos et le footer pour la première page"""
+        # Dessiner les logos normalement
+        self._draw_logo(canvas, doc)
+        
+        # Dessiner le footer en position absolue en bas de page
+        canvas.saveState()
+        page_width, page_height = doc.pagesize
+        
+        # Texte du footer
+        footer_text1 = "EN CAS DE PANNE SUR LE SYSTÈME VENTURI, CONTACTEZ LE SUPPORT TECHNIQUE AU 03 88 64 72 10."
+        
+        # Position du footer : 1.0cm du bas de la page
+        y_position = 1.0*cm
+        
+        # Première ligne en noir
+        canvas.setFont('Helvetica', 8)
+        canvas.setFillColor(colors.black)
+        canvas.drawCentredString(page_width / 2, y_position + 0.4*cm, footer_text1)
+        
+        # Deuxième ligne avec email en bleu
+        footer_text2_part1 = "UNE QUESTION SUR VOTRE CONTRAT ? CONTACTEZ NOTRE SUPPORT ADMINISTRATIF AU 03 88 64 85 79 OU PAR MAIL "
+        footer_email = "SYSTEMES.SOLUTIONS@WURTH.FR"
+        
+        # Calculer les largeurs pour centrer correctement
+        text_width_part1 = canvas.stringWidth(footer_text2_part1, 'Helvetica', 8)
+        text_width_email = canvas.stringWidth(footer_email, 'Helvetica', 8)
+        total_width = text_width_part1 + text_width_email
+        
+        # Position de départ pour centrer le tout
+        start_x = (page_width - total_width) / 2
+        
+        # Dessiner la première partie en noir
+        canvas.setFillColor(colors.black)
+        canvas.drawString(start_x, y_position, footer_text2_part1)
+        
+        # Dessiner l'email en bleu
+        canvas.setFillColor(colors.blue)
+        canvas.drawString(start_x + text_width_part1, y_position, footer_email)
+        
+        canvas.restoreState()
+    
+    def _draw_logo(self, canvas, doc):
+        """Dessine les logos Würth (gauche) et TMH (droite) en haut de chaque page"""
+        canvas.saveState()
+        
+        page_width, page_height = doc.pagesize
+        
+        # Logo Würth à gauche
+        wurth_logo_path = self.base_dir / "images" / "Würth_logo.png"
+        if wurth_logo_path.exists():
+            try:
+                with PILImage.open(wurth_logo_path) as img:
+                    img_width, img_height = img.size
+                    ratio = img_height / img_width
+                
+                logo_width = 4.5*cm
+                logo_height = logo_width * ratio
+                
+                x = 0.8*cm
+                y = page_height - logo_height - 0.8*cm
+                
+                canvas.drawImage(str(wurth_logo_path), x, y, width=logo_width, height=logo_height, preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                logger.warning(f"Erreur lors du chargement du logo Würth: {e}")
+        
+        # Logo TMH au centre
+        tmh_logo_path = self.base_dir / "images" / "Logo - Solution de lavage connecté.png"
+        if tmh_logo_path.exists():
+            try:
+                with PILImage.open(tmh_logo_path) as img:
+                    img_width, img_height = img.size
+                    ratio = img_height / img_width
+                
+                logo_width = 12*cm
+                logo_height = logo_width * ratio
+                
+                x = (page_width - logo_width) / 2
+                y = page_height - logo_height - 0.7*cm
+                
+                canvas.drawImage(str(tmh_logo_path), x, y, width=logo_width, height=logo_height, preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                logger.warning(f"Erreur lors du chargement du logo TMH: {e}")
+        
+        canvas.restoreState()
+    
+    # Nombre maximum de sites affiches par page (graphique + tableau par site).
+    # Au-dela, la page est decoupee en plusieurs pages de 4 sites pour rester lisible.
+    MAX_SITES_PER_PAGE = 4
+
+    def _short_site_name(self, name: str) -> str:
+        """Nom de site court et lisible (sans code client en tete, sans tabulations)."""
+        n = str(name or "")
+        if "|" in n:
+            n = n.split("|")[-1]
+        n = re.sub(r'\s+', ' ', n.replace('\t', ' ')).strip()
+        n = re.sub(r'^\d{10}\s*', '', n)  # retirer le code client "107..." en tete
+        return n.strip()
+
+    def _render_facility_consumption_body(self, elements: List, facilities_chunk: List, owner_name: str):
+        """Ajoute le graphique + le tableau de consommation par site pour un lot de sites."""
+        chart_gen = ConsumptionChartGenerator()
+        chart_buffer = chart_gen.create_group_facility_chart(facilities_chunk, owner_name)
+        elements.append(Image(chart_buffer, width=26*cm, height=7*cm))
+        elements.append(Spacer(1, 0.5*cm))
+
+        facility_names, product_names, product_facility_qty = chart_gen.get_aggregated_facility_data(facilities_chunk)
+        if facility_names and product_names:
+            # Cellules en Paragraph -> le texte revient a la ligne et la cellule
+            # s'adapte a la hauteur du nom (sites/produits qui ne rentraient pas).
+            header_cell_style = ParagraphStyle(
+                'GrpHeaderCell', fontName='Helvetica-Bold', fontSize=7,
+                alignment=TA_CENTER, leading=8, textColor=colors.black
+            )
+            product_cell_style = ParagraphStyle(
+                'GrpProductCell', fontName='Helvetica-Bold', fontSize=7,
+                alignment=TA_LEFT, leading=8, textColor=colors.black
+            )
+            qty_cell_style = ParagraphStyle(
+                'GrpQtyCell', fontName='Helvetica', fontSize=7,
+                alignment=TA_CENTER, leading=8, textColor=colors.black
+            )
+
+            header_row = [Paragraph("PRODUITS", header_cell_style)]
+            for name in facility_names:
+                header_row.append(Paragraph(normalize_text(name).upper(), header_cell_style))
+            table_data = [header_row]
+            for product_name in product_names:
+                row = [Paragraph(product_name.upper(), product_cell_style)]
+                for fac_name in facility_names:
+                    qty = product_facility_qty.get(product_name, {}).get(fac_name, 0)
+                    row.append(Paragraph(f"{qty:.2f} L".replace('.', ','), qty_cell_style))
+                table_data.append(row)
+
+            num_cols = len(header_row)
+            first_col_width = 5.5*cm
+            remaining_width = 20.5*cm
+            other_col_width = remaining_width / max(num_cols - 1, 1)
+            col_widths = [first_col_width] + [other_col_width] * (num_cols - 1)
+
+            table = Table(table_data, colWidths=col_widths)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.Color(0.85, 0.85, 0.85)),
+                ('BACKGROUND', (0, 1), (0, -1), colors.Color(0.95, 0.95, 0.95)),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('BOX', (0, 0), (-1, -1), 1, colors.black),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('LEFTPADDING', (0, 0), (-1, -1), 3),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 0.5*cm))
+
+        explanation_style = ParagraphStyle(
+            'ChartExplanation',
+            fontName='Helvetica',
+            fontSize=8,
+            alignment=TA_LEFT,
+            textColor=colors.black
+        )
+        legend_text = "CE GRAPHIQUE ET CE TABLEAU PRÉSENTENT LA CONSOMMATION TOTALE PAR PRODUIT POUR CHAQUE SITE DU GROUPE SUR LA PÉRIODE SÉLECTIONNÉE.<br/>LES CONSOMMATIONS SONT EXPRIMÉES EN LITRES."
+        elements.append(Paragraph(legend_text, explanation_style))
+
+    def _filter_facilities_products(self, facilities_data: List, water: bool) -> List:
+        """Renvoie les facilities avec leurs produits filtres : eau seule (water=True)
+        ou tout sauf l'eau (water=False). L'eau est identifiee via le canonique EAU."""
+        result = []
+        for f in facilities_data:
+            prods = [
+                p for p in f.get("products", [])
+                if (match_group_canonical(p.get("name", "")) == "EAU") == water
+            ]
+            result.append({"facilityName": f.get("facilityName", ""), "products": prods})
+        return result
+
+    def _render_consumption_section(self, elements, owner_name, facilities_data, from_date, to_date, title):
+        """Rend une section 'consommation par site' (graphique + tableau) sous un titre
+        donne, paginee par MAX_SITES_PER_PAGE sites."""
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('ChartTitle', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=14, alignment=TA_CENTER)
+        subtitle_style = ParagraphStyle('ChartSubtitle', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=TA_CENTER)
+        sites_style = ParagraphStyle('ChartSites', parent=styles['Normal'], fontName='Helvetica-Oblique', fontSize=8, alignment=TA_CENTER, textColor=colors.Color(0.3, 0.3, 0.3))
+
+        from_date_formatted = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        to_date_formatted = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        periode = f"PÉRIODE DU {from_date_formatted} AU {to_date_formatted}"
+
+        paginate = len(facilities_data) > self.MAX_SITES_PER_PAGE
+        chunks = [
+            facilities_data[i:i + self.MAX_SITES_PER_PAGE]
+            for i in range(0, len(facilities_data), self.MAX_SITES_PER_PAGE)
+        ]
+
+        for idx, chunk in enumerate(chunks):
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 0.15*cm if paginate else 0.5*cm))
+            elements.append(Paragraph(title, title_style))
+            elements.append(Spacer(1, 0.2*cm if paginate else 0.3*cm))
+            elements.append(Paragraph(periode, subtitle_style))
+            if paginate:
+                sites_line = " · ".join(
+                    normalize_text(self._short_site_name(f["facilityName"])) for f in chunk
+                )
+                elements.append(Spacer(1, 0.1*cm))
+                elements.append(Paragraph(f"Page {idx + 1}/{len(chunks)} - Sites : {sites_line}", sites_style))
+            elements.append(Spacer(1, 0.4*cm if paginate else 0.5*cm))
+            self._render_facility_consumption_body(elements, chunk, owner_name)
+
+    def _add_facility_consumption_chart(
+        self,
+        elements: List,
+        owner_name: str,
+        owner_data: Dict[str, Any],
+        from_date: str,
+        to_date: str
+    ):
+        """
+        Page "REPARTITION DES CONSOMMATIONS DE PRODUITS PAR SITE".
+        L'eau (bien superieure aux produits) est mise sur une page separee pour ne pas
+        ecraser les produits. Chaque section est paginee par 4 sites max.
+        """
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('ChartTitleE', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=14, alignment=TA_CENTER)
+        subtitle_style = ParagraphStyle('ChartSubtitleE', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=TA_CENTER)
+        from_date_formatted = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        to_date_formatted = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        periode = f"PÉRIODE DU {from_date_formatted} AU {to_date_formatted}"
+
+        facilities_data = [
+            {"facilityName": f.get("facilityName", ""), "products": f.get("products", [])}
+            for f in owner_data.get("facilities", [])
+        ]
+
+        if not facilities_data:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 0.5*cm))
+            elements.append(Paragraph("REPARTITION DES CONSOMMATIONS DE PRODUITS PAR SITE", title_style))
+            elements.append(Spacer(1, 0.3*cm))
+            elements.append(Paragraph(periode, subtitle_style))
+            elements.append(Spacer(1, 0.5*cm))
+            elements.append(Paragraph("Aucune donnée de consommation disponible pour ce groupe.", subtitle_style))
+            return
+
+        products_data = self._filter_facilities_products(facilities_data, water=False)
+        water_data = self._filter_facilities_products(facilities_data, water=True)
+
+        if any(f["products"] for f in products_data):
+            self._render_consumption_section(
+                elements, owner_name, products_data, from_date, to_date,
+                "REPARTITION DES CONSOMMATIONS DE PRODUITS PAR SITE"
+            )
+        if any(f["products"] for f in water_data):
+            self._render_consumption_section(
+                elements, owner_name, water_data, from_date, to_date,
+                "REPARTITION DE LA CONSOMMATION D'EAU PAR SITE"
+            )
+    
+    def _render_product_total_page(self, elements, owner_name, facilities_data, from_date, to_date, title):
+        """Rend une page 'consommation totale par produit' (une barre par produit)."""
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('ChartTitle2', parent=styles['Title'], fontName='Helvetica-Bold', fontSize=14, alignment=TA_CENTER)
+        subtitle_style = ParagraphStyle('ChartSubtitle2', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=TA_CENTER)
+
+        from_date_formatted = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        to_date_formatted = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+
+        elements.append(PageBreak())
+        elements.append(Spacer(1, 0.5*cm))
+        elements.append(Paragraph(title, title_style))
+        elements.append(Spacer(1, 0.3*cm))
+        elements.append(Paragraph(f"PÉRIODE DU {from_date_formatted} AU {to_date_formatted}", subtitle_style))
+        elements.append(Spacer(1, 2*cm))
+
+        chart_gen = ConsumptionChartGenerator()
+        chart_buffer = chart_gen.create_group_product_total_chart(facilities_data, owner_name)
+        elements.append(Image(chart_buffer, width=26*cm, height=10*cm))
+        elements.append(Spacer(1, 0.5*cm))
+
+        explanation_style = ParagraphStyle('ChartExplanation2', fontName='Helvetica', fontSize=8, alignment=TA_LEFT, textColor=colors.black)
+        legend_text = "CE GRAPHIQUE PRÉSENTE LA CONSOMMATION TOTALE PAR PRODUIT POUR L'ENSEMBLE DES SITES DU GROUPE SUR LA PÉRIODE SÉLECTIONNÉE.<br/>LES CONSOMMATIONS SONT EXPRIMÉES EN LITRES."
+        elements.append(Paragraph(legend_text, explanation_style))
+
+    def _add_product_total_chart(
+        self,
+        elements: List,
+        owner_name: str,
+        owner_data: Dict[str, Any],
+        from_date: str,
+        to_date: str
+    ):
+        """
+        Page "SUIVI DE LA CONSOMMATION TOTALE PAR PRODUIT".
+        L'eau est mise sur une page separee (sinon elle ecrase les produits).
+        """
+        styles = getSampleStyleSheet()
+        subtitle_style = ParagraphStyle('ChartSubtitle2b', parent=styles['Normal'], fontName='Helvetica', fontSize=10, alignment=TA_CENTER)
+
+        facilities_data = [
+            {"facilityName": f.get("facilityName", ""), "products": f.get("products", [])}
+            for f in owner_data.get("facilities", [])
+        ]
+
+        if not facilities_data:
+            elements.append(PageBreak())
+            elements.append(Spacer(1, 2*cm))
+            elements.append(Paragraph("AUCUNE DONNÉE DE CONSOMMATION DISPONIBLE POUR CE GROUPE.", subtitle_style))
+            return
+
+        products_data = self._filter_facilities_products(facilities_data, water=False)
+        water_data = self._filter_facilities_products(facilities_data, water=True)
+
+        if any(f["products"] for f in products_data):
+            self._render_product_total_page(
+                elements, owner_name, products_data, from_date, to_date,
+                "SUIVI DE LA CONSOMMATION TOTALE PAR PRODUIT"
+            )
+        if any(f["products"] for f in water_data):
+            self._render_product_total_page(
+                elements, owner_name, water_data, from_date, to_date,
+                "SUIVI DE LA CONSOMMATION TOTALE D'EAU"
+            )
+    
+    def _add_delivered_products_page(
+        self,
+        elements: List,
+        owner_name: str,
+        owner_data: Dict[str, Any],
+        from_date: str,
+        to_date: str
+    ):
+        """
+        Ajoute la page des produits livrés (dernière page du rapport de groupe)
+        Utilise les vraies données Odoo agrégées par owner
+        """
+        styles = getSampleStyleSheet()
+        
+        # Saut de page
+        elements.append(PageBreak())
+        
+        # Style pour le titre
+        title_style = ParagraphStyle(
+            'DeliveredTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        # Récupérer les données Odoo agrégées pour ce owner
+        products_by_month_raw = owner_data.get("odoo_products_by_month", {})
+        
+        # Générer les en-têtes pour l'année en cours (janvier à décembre)
+        end_date = datetime.strptime(to_date, "%Y-%m-%d")
+        current_year = end_date.year
+        # Utiliser le mois de la date de fin du rapport (to_date) comme limite
+        report_end_month = end_date.month
+        
+        # Fonction pour extraire la référence produit (numéro entre crochets)
+        import re
+        # Regrouper par PRODUIT CANONIQUE (liste des rapports de groupe) et ne GARDER
+        # QUE les produits chimiques de cette liste (le materiel/service est exclu).
+        # Les variantes d'un meme produit (ecocube/200L, "L"/"litres"...) sont fusionnees.
+        products_by_month = {}  # {nom_canonique: {month_int: qty}}
+
+        for product_name, months_data in products_by_month_raw.items():
+            canonical = match_group_canonical(product_name)
+            if not canonical:
+                continue  # produit hors liste (materiel, consommable, SAV...) -> exclu
+
+            if canonical not in products_by_month:
+                products_by_month[canonical] = {}
+
+            for month_key, qty in months_data.items():
+                try:
+                    # month_key est au format "YYYY-MM"
+                    year_str, month_str = month_key.split("-")
+                    if int(year_str) == current_year:
+                        month_int = int(month_str)
+                        # Ne garder que les mois jusqu'à la date de fin du rapport
+                        if month_int <= report_end_month:
+                            products_by_month[canonical][month_int] = \
+                                products_by_month[canonical].get(month_int, 0) + qty
+                except Exception:
+                    continue
+
+        # Supprimer les produits sans données pour l'année en cours
+        products_by_month = {k: v for k, v in products_by_month.items() if v}
+        
+        # Calculer la hauteur approximative du tableau
+        num_products = max(len(products_by_month), 1)
+        row_height = 0.6  # cm par ligne environ
+        table_height = (num_products + 1) * row_height  # +1 pour l'en-tête
+        title_height = 1.5  # cm pour le titre et espacements
+        total_content_height = table_height + title_height
+        
+        # Hauteur disponible sur la page (A4 paysage moins marges)
+        available_height = 14  # cm environ
+        
+        # Spacer pour centrer verticalement
+        top_spacer = max((available_height - total_content_height) / 2, 0.5)
+        elements.append(Spacer(1, top_spacer*cm))
+        
+        # Titre
+        elements.append(Paragraph("PRODUITS LIVRÉS", title_style))
+        elements.append(Spacer(1, 0.5*cm))
+        
+        # Mois de janvier à décembre de l'année en cours
+        month_headers = []
+        for month in range(1, 13):
+            month_headers.append(f"{month:02d}/{str(current_year)[-2:]}")
+        
+        # Créer le tableau avec les produits livrés depuis Odoo
+        table_data = [["PRODUITS"] + month_headers]
+        
+        if products_by_month:
+            for product_name in sorted(products_by_month.keys()):
+                monthly_data = products_by_month[product_name]
+                row = [Paragraph(product_name, product_name_style)]
+                
+                for month in range(1, 13):
+                    if month in monthly_data:
+                        qty = monthly_data[month]
+                        # Afficher la quantité (entier si pas de décimales)
+                        if qty == int(qty):
+                            row.append(str(int(qty)))
+                        else:
+                            row.append(f"{qty:.1f}")
+                    elif month > report_end_month:
+                        row.append("")  # Mois après la date de fin du rapport = case vide
+                    else:
+                        row.append("-")  # Mois passé sans livraison
+                
+                table_data.append(row)
+        else:
+            # Aucune donnée Odoo disponible
+            example_row = [Paragraph("AUCUNE LIVRAISON", product_name_style)]
+            for month in range(1, 13):
+                if month > report_end_month:
+                    example_row.append("")
+                else:
+                    example_row.append("-")
+            table_data.append(example_row)
+        
+        # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+        available_width = 28.7*cm
+        product_col_width = 6*cm
+        col_width = (available_width - product_col_width) / 12  # Reste divisé par 12 mois
+        table = Table(table_data, colWidths=[product_col_width] + [col_width]*12)
+        table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ]))
+        elements.append(table)

@@ -1,0 +1,27 @@
+services:
+  tmh-api:
+    build: .
+    container_name: tmh-container-v2
+    ports:
+      - "8000:8000"
+    restart: always
+    environment:
+      - DATA_ROOT=/app/reports
+      - TZ=Europe/Paris
+      - ODOO_URL=https://tmh-corporation-odoo.odoo.com
+      - DEBUG_MODE=${DEBUG_MODE:-true}
+      - SMTP_HOST=${SMTP_HOST:-smtp-mail.outlook.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM=${SMTP_FROM}
+    volumes:
+      - ./reports:/app/reports
+      - ./reports:/app/refactored/reports
+      - ./uploads:/app/uploads
+      - ./uploads:/app/refactored/uploads
+      - ./config:/app/config
+      - ./config:/app/refactored/config
+      - ./cache:/app/cache
+      - ./cache:/app/refactored/cache
+      - ./frontend:/app/refactored/frontend

@@ -1,0 +1,1591 @@
+import os
+from pathlib import Path
+from datetime import datetime, timedelta
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from PIL import Image as PILImage
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+import numpy as np
+import io
+import re
+import unicodedata
+from refactored.config.settings import REPORTS_OUTPUT_DIR, REFACTORED_DIR
+from refactored.utils.product_naming import canonical_product_name, merge_products_by_canonical, site_has_overrides
+
+def normalize_product_name(name: str) -> str:
+    """Normalise un nom de produit pour le matching"""
+    if not name:
+        return ""
+    # Retirer les accents
+    name = ''.join(c for c in unicodedata.normalize('NFD', name) if unicodedata.category(c) != 'Mn')
+    # Majuscules, retirer espaces et tirets
+    name = name.upper().replace(" ", "").replace("-", "")
+    return name
+
+def get_excel_product_name(api_product_name: str, facility_data: dict) -> str:
+    """
+    Mappe un nom de produit API vers le nom Excel correspondant
+    
+    Args:
+        api_product_name: Nom du produit depuis l'API (ex: "WNC50 - Zone 1")
+        facility_data: Données de la facility contenant les produits Excel
+        
+    Returns:
+        Nom du produit Excel ou le nom API si pas de match
+    """
+    from refactored.utils.logger import get_logger
+    logger = get_logger("Product_Matching")
+    
+    # Extraire tous les produits Excel de la facility
+    excel_products = []
+    
+    # Produits par zone
+    for zone_num in range(1, 6):
+        for prod_type in ["lavant", "sechant", "jantes", "mousse"]:
+            key = f"produit_{prod_type}_zone{zone_num}"
+            excel_name = facility_data.get(key)
+            if excel_name:
+                excel_products.append((prod_type, excel_name, key))
+    
+    # Produits globaux (sans zone)
+    for prod_type in ["lavant", "sechant", "jantes", "mousse"]:
+        key = f"produit_{prod_type}"
+        excel_name = facility_data.get(key)
+        if excel_name:
+            excel_products.append((prod_type, excel_name, key))
+    
+    # Normaliser le nom API
+    normalized_api = normalize_product_name(api_product_name)
+    
+    logger.debug(f"🔍 Matching '{api_product_name}' (normalisé: '{normalized_api}')")
+    logger.debug(f"   Produits Excel disponibles: {len(excel_products)}")
+    
+    # Chercher le meilleur match
+    for prod_type, excel_name, key in excel_products:
+        if not excel_name:
+            continue
+        
+        normalized_excel = normalize_product_name(excel_name)
+        
+        logger.debug(f"   Comparaison avec {prod_type} ({key}): '{excel_name}' (normalisé: '{normalized_excel}')")
+        
+        # Match direct
+        if normalized_api in normalized_excel or normalized_excel in normalized_api:
+            logger.info(f"   ✅ Match direct: '{api_product_name}' → '{excel_name}'")
+            return excel_name
+        
+        # Match spécial pour autoséchant
+        if prod_type == "sechant":
+            if "AUTOSECHANT" in normalized_api or "SECHANT" in normalized_api:
+                logger.info(f"   ✅ Match séchant: '{api_product_name}' → '{excel_name}'")
+                return excel_name
+        
+        # Match spécial pour jantes (ex: "Nettoyant jante bmw P" -> "Nettoyant jantes purple")
+        if prod_type == "jantes":
+            if "JANTE" in normalized_api or "JANTES" in normalized_api:
+                # Vérifier si les mots clés correspondent
+                api_words = set(normalized_api.split())
+                excel_words = set(normalized_excel.split())
+                
+                logger.debug(f"      Mots API: {api_words}")
+                logger.debug(f"      Mots Excel: {excel_words}")
+                
+                # Si "PURPLE" ou "P" dans API et "PURPLE" dans Excel
+                if ("PURPLE" in api_words or "P" in api_words) and "PURPLE" in normalized_excel:
+                    logger.info(f"   ✅ Match jantes PURPLE: '{api_product_name}' → '{excel_name}'")
+                    return excel_name
+                # Si "BMW" dans les deux
+                if "BMW" in api_words and "BMW" in excel_words:
+                    logger.info(f"   ✅ Match jantes BMW: '{api_product_name}' → '{excel_name}'")
+                    return excel_name
+                # Match générique pour jantes si pas d'autres spécificités
+                if "NETTOYANT" in normalized_api and "NETTOYANT" in normalized_excel:
+                    logger.info(f"   ✅ Match jantes générique: '{api_product_name}' → '{excel_name}'")
+                    return excel_name
+        
+        # Match par numéro WNC
+        api_wnc_match = re.search(r'WNC\s*(\d+)', normalized_api, re.IGNORECASE)
+        excel_wnc_match = re.search(r'WNC\s*(\d+)', normalized_excel, re.IGNORECASE)
+        if api_wnc_match and excel_wnc_match:
+            api_wnc_num = api_wnc_match.group(1)
+            excel_wnc_num = excel_wnc_match.group(1)
+            if api_wnc_num == excel_wnc_num:
+                # Vérifier aussi UC/ULTRACONCENTRÉ
+                if "UC" in normalized_api and "ULTRACONCENTRE" in normalized_excel:
+                    logger.info(f"   ✅ Match WNC UC: '{api_product_name}' → '{excel_name}'")
+                    return excel_name
+                if "UC" not in normalized_api and "ULTRACONCENTRE" not in normalized_excel:
+                    logger.info(f"   ✅ Match WNC: '{api_product_name}' → '{excel_name}'")
+                    return excel_name
+    
+    # Pas de match trouvé, retourner le nom API
+    logger.warning(f"   ⚠️ Aucun match trouvé pour '{api_product_name}', utilisation du nom API")
+    return api_product_name
+
+class PDFGenerator:
+    """Générateur de PDF utilisant ReportLab"""
+    
+    def __init__(self):
+        self.output_dir = REPORTS_OUTPUT_DIR
+        self.config_dir = REFACTORED_DIR / "config"
+        self.base_dir = REFACTORED_DIR
+        
+    def generate_facility_report(self, facility_data: dict, from_date: str, to_date: str) -> str:
+        """
+        Génère un rapport PDF pour une facility
+        
+        Args:
+            facility_data: Données complètes de la facility (depuis FacilityService)
+            from_date: Date de début (YYYY-MM-DD)
+            to_date: Date de fin (YYYY-MM-DD)
+            
+        Returns:
+            Chemin du PDF généré
+        """
+        facility_id = facility_data.get("facility_id")
+        print(f"📄 Début génération PDF pour facility {facility_id}")
+        
+        folder_name = f"reports {from_date} to {to_date}"
+        output_dir = self.output_dir / folder_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        client_number = facility_data.get("client_number", facility_id)
+        client_name = (facility_data.get("client_name") or "Unknown").replace(" ", "_")
+        
+        pdf_filename = f"Rapports_de_consommation_E-wash_{client_name}_{client_number}.pdf"
+        pdf_path = output_dir / pdf_filename
+        
+        print(f"📄 Création du PDF: {pdf_path}")
+        self._create_pdf(facility_data, from_date, to_date, str(pdf_path))
+        
+        print(f"✅ PDF créé avec succès: {pdf_path}")
+        return str(pdf_path)
+    
+    def _create_pdf(self, facility_data: dict, from_date: str, to_date: str, output_path: str):
+        """Crée le PDF avec ReportLab"""
+        doc = SimpleDocTemplate(
+            output_path,
+            pagesize=landscape(A4),
+            leftMargin=0.5*cm,
+            rightMargin=0.5*cm,
+            topMargin=3*cm,
+            bottomMargin=0.8*cm
+        )
+        
+        story = []
+        styles = getSampleStyleSheet()
+        
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        story.extend(self._create_cover_page(facility_data, from_date, to_date, title_style))
+        
+        story.append(PageBreak())
+        
+        story.extend(self._create_dilution_page(facility_data, styles))
+        
+        # Pages de débit moyen par zone
+        story.extend(self._create_flowrate_pages(facility_data, from_date, to_date, styles))
+        
+        # Pas de PageBreak ici car le premier graphique a déjà son PageBreak
+        story.extend(self._create_consumption_pages(facility_data, from_date, to_date, styles))
+        
+        # Tableaux zonés uniquement si plus d'une zone
+        zones = facility_data.get("zones", ["GLOBAL"])
+        if len(zones) > 1:
+            # 1. Tableau quotidien par zone (PREMIER)
+            story.extend(self._create_daily_average_by_zone_table(facility_data, from_date, to_date, styles))
+            # 2. Tableau total par zone (SECOND)
+            story.extend(self._create_daily_total_by_zone_table(facility_data, from_date, to_date, styles))
+        # 3. Tableau quotidien global
+        story.extend(self._create_daily_consumption_tables(facility_data, from_date, to_date, styles))
+        # 4. Tableau mensuel unique
+        story.extend(self._create_monthly_consumption_table(facility_data, from_date, to_date, styles))
+        # 5. Tableau des produits livrés
+        story.extend(self._create_delivered_products_table(facility_data, from_date, to_date, styles))
+        
+        doc.build(story, onFirstPage=self._draw_first_page, onLaterPages=self._draw_logo)
+    
+    def _create_cover_page(self, facility_data: dict, from_date: str, to_date: str, title_style):
+        """Crée la page de garde"""
+        elements = []
+        
+        from_date_formatted = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        to_date_formatted = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        
+        client_number = facility_data.get("client_number")
+        client_name = facility_data.get("client_name") or facility_data.get("facility_name") or "Unknown"
+        address = facility_data.get("address") or ""
+        
+        if client_number:
+            client_text = f"{client_number} - {client_name.upper()}"
+        else:
+            client_text = client_name.upper()
+        
+        if address:
+            client_text += f" - {address.upper()}"
+        
+        elements.append(Spacer(1, 0.1*cm))
+        
+        elements.append(Paragraph(
+            f"RAPPORT DE CONSOMMATION DU {from_date_formatted} AU {to_date_formatted}".upper(),
+            title_style
+        ))
+        elements.append(Spacer(1, 0.2*cm))
+        
+        elements.append(Paragraph(client_text, title_style))
+        elements.append(Spacer(1, 0.2*cm))
+        
+        serial_numbers = [d.get("serial_number", "") for d in facility_data.get("devices", [])]
+        if serial_numbers:
+            router_text = ("N°ROUTEUR(S): " + " / ".join(serial_numbers)).upper()
+            elements.append(Paragraph(router_text, title_style))
+            elements.append(Spacer(1, 0.5*cm))
+        
+        cover_picture_path = facility_data.get("cover_picture_path", "")
+        if cover_picture_path:
+            img_path = self.base_dir / cover_picture_path.lstrip("/")
+            if img_path.exists():
+                try:
+                    # Charger l'image pour obtenir ses dimensions réelles
+                    with PILImage.open(img_path) as pil_img:
+                        img_width, img_height = pil_img.size
+                        ratio = img_height / img_width
+                    
+                    # Définir la largeur maximale et calculer la hauteur proportionnelle
+                    max_width = 16*cm
+                    calculated_height = max_width * ratio
+                    
+                    # Limiter la hauteur maximale pour ne pas déborder
+                    max_height = 10*cm
+                    if calculated_height > max_height:
+                        calculated_height = max_height
+                        max_width = calculated_height / ratio
+                    
+                    img = Image(str(img_path), width=max_width, height=calculated_height)
+                    elements.append(img)
+                except Exception as e:
+                    print(f"Erreur lors du chargement de l'image de la facility: {e}")
+        
+        # Le footer sera dessiné en position absolue dans _draw_first_page_footer
+        
+        return elements
+    
+    def _create_dilution_page(self, facility_data: dict, styles):
+        """Crée la page d'informations Excel avec tableau à 2 colonnes"""
+        elements = []
+        
+        # Debug: afficher les données Excel reçues
+        print("\n" + "="*80)
+        print("DEBUG: Données Excel dans _create_dilution_page")
+        print("="*80)
+        print(f"installation_date: {facility_data.get('installation_date')}")
+        print(f"zone_number: {facility_data.get('zone_number')}")
+        print(f"router_number: {facility_data.get('router_number')}")
+        print(f"last_intervention: {facility_data.get('last_intervention')}")
+        print(f"produit_lavant: {facility_data.get('produit_lavant')}")
+        print(f"dilution_lavant: {facility_data.get('dilution_lavant')}")
+        print(f"couleur_buse_lavant: {facility_data.get('couleur_buse_lavant')}")
+        print("="*80 + "\n")
+        
+        title_style = ParagraphStyle(
+            'InfoTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        elements.append(Paragraph("INFORMATIONS DE DILUTION".upper(), title_style))
+        elements.append(Spacer(1, 0.5*cm))
+        
+        # Tableau à 2 colonnes : Nom de la colonne | Valeur
+        table_data = []
+        
+        # Fonction helper pour formater les valeurs
+        def format_value(val):
+            if val is None or val == "":
+                return "-"
+            return str(val).upper()
+        
+        def format_dilution(val):
+            """Convertit une dilution en pourcentage (ex: 0.098 -> 9,80%)"""
+            if val is None or val == "":
+                return "-"
+            try:
+                # Multiplier par 100 pour avoir le vrai pourcentage
+                dilution_num = float(val) * 100
+                # Formater avec 2 décimales et virgule
+                return f"{dilution_num:.2f}%".replace('.', ',')
+            except (ValueError, TypeError):
+                return str(val).upper()
+        
+        # Informations générales
+        table_data.append(["DATE INSTALLATION", format_value(facility_data.get("installation_date"))])
+        table_data.append(["N° DE ZONE DE LAVAGE", format_value(facility_data.get("zone_number"))])
+        table_data.append(["N° DE ROUTEUR", format_value(facility_data.get("router_number"))])
+        table_data.append(["DATE DERNIÈRE INTERVENTION", format_value(facility_data.get("last_intervention"))])
+        
+        # Marqueur pour les séparateurs de zones
+        zone_separators = [3]  # Après les infos générales (ligne 3)
+        
+        # Zone 1 (principale)
+        zone1_start = len(table_data)
+        if facility_data.get("produit_lavant"):
+            table_data.append(["PRODUITS LAVANT", format_value(facility_data.get("produit_lavant"))])
+            table_data.append(["DILUTION LAVANT", format_dilution(facility_data.get("dilution_lavant"))])
+            table_data.append(["COULEUR BUSE LAVANT", format_value(facility_data.get("couleur_buse_lavant"))])
+        
+        if facility_data.get("produit_sechant"):
+            table_data.append(["PRODUITS SÉCHANT", format_value(facility_data.get("produit_sechant"))])
+            table_data.append(["DILUTION SÉCHANT", format_dilution(facility_data.get("dilution_sechant"))])
+            table_data.append(["COULEUR BUSE SÉCHANT", format_value(facility_data.get("couleur_buse_sechant"))])
+        
+        if facility_data.get("autre_produit_lavant"):
+            table_data.append(["AUTRES PRODUITS LAVANT", format_value(facility_data.get("autre_produit_lavant"))])
+            table_data.append(["AUTRE DILUTION LAVANT", format_dilution(facility_data.get("autre_dilution_lavant"))])
+            table_data.append(["AUTRE COULEUR BUSE LAVANT", format_value(facility_data.get("autre_couleur_buse_lavant"))])
+        
+        if facility_data.get("produit_jantes"):
+            table_data.append(["PRODUITS JANTES", format_value(facility_data.get("produit_jantes"))])
+            table_data.append(["DILUTION JANTES", format_dilution(facility_data.get("dilution_jantes"))])
+        
+        # Zone 2
+        zone2_start = len(table_data)
+        if facility_data.get("produit_lavant_zone2"):
+            if zone2_start > zone1_start:
+                zone_separators.append(zone2_start - 1)
+            table_data.append(["PRODUITS LAVANT ZONE 2", format_value(facility_data.get("produit_lavant_zone2"))])
+            table_data.append(["DILUTION LAVANT ZONE 2", format_dilution(facility_data.get("dilution_lavant_zone2"))])
+            table_data.append(["COULEUR BUSE LAVANT ZONE 2", format_value(facility_data.get("couleur_buse_lavant_zone2"))])
+        
+        if facility_data.get("produit_sechant_zone2"):
+            table_data.append(["PRODUITS SÉCHANT ZONE 2", format_value(facility_data.get("produit_sechant_zone2"))])
+            table_data.append(["DILUTION SÉCHANT ZONE 2", format_dilution(facility_data.get("dilution_sechant_zone2"))])
+            table_data.append(["COULEUR BUSE SÉCHANT ZONE 2", format_value(facility_data.get("couleur_buse_sechant_zone2"))])
+        
+        if facility_data.get("autre_produit_lavant_zone2"):
+            table_data.append(["AUTRES PRODUITS LAVANT ZONE 2", format_value(facility_data.get("autre_produit_lavant_zone2"))])
+            table_data.append(["AUTRE DILUTION LAVANT ZONE 2", format_dilution(facility_data.get("autre_dilution_lavant_zone2"))])
+            table_data.append(["AUTRE COULEUR BUSE LAVANT ZONE 2", format_value(facility_data.get("autre_couleur_buse_lavant_zone2"))])
+        
+        # Zone 3
+        zone3_start = len(table_data)
+        if facility_data.get("produit_lavant_zone3"):
+            if zone3_start > zone2_start:
+                zone_separators.append(zone3_start - 1)
+            table_data.append(["PRODUITS LAVANT ZONE 3", format_value(facility_data.get("produit_lavant_zone3"))])
+            table_data.append(["DILUTION LAVANT ZONE 3", format_dilution(facility_data.get("dilution_lavant_zone3"))])
+            table_data.append(["COULEUR BUSE LAVANT ZONE 3", format_value(facility_data.get("couleur_buse_lavant_zone3"))])
+        
+        if facility_data.get("produit_sechant_zone3"):
+            table_data.append(["PRODUITS SÉCHANT ZONE 3", format_value(facility_data.get("produit_sechant_zone3"))])
+            table_data.append(["DILUTION SÉCHANT ZONE 3", format_dilution(facility_data.get("dilution_sechant_zone3"))])
+            table_data.append(["COULEUR BUSE SÉCHANT ZONE 3", format_value(facility_data.get("couleur_buse_sechant_zone3"))])
+        
+        # Zone 4
+        zone4_start = len(table_data)
+        if facility_data.get("produit_lavant_zone4"):
+            if zone4_start > zone3_start:
+                zone_separators.append(zone4_start - 1)
+            table_data.append(["PRODUITS LAVANT ZONE 4", format_value(facility_data.get("produit_lavant_zone4"))])
+            table_data.append(["DILUTION LAVANT ZONE 4", format_dilution(facility_data.get("dilution_lavant_zone4"))])
+            table_data.append(["COULEUR BUSE LAVANT ZONE 4", format_value(facility_data.get("couleur_buse_lavant_zone4"))])
+        
+        if facility_data.get("produit_sechant_zone4"):
+            table_data.append(["PRODUITS SÉCHANT ZONE 4", format_value(facility_data.get("produit_sechant_zone4"))])
+            table_data.append(["DILUTION SÉCHANT ZONE 4", format_dilution(facility_data.get("dilution_sechant_zone4"))])
+            table_data.append(["COULEUR BUSE SÉCHANT ZONE 4", format_value(facility_data.get("couleur_buse_sechant_zone4"))])
+        
+        # Zone 5
+        zone5_start = len(table_data)
+        if facility_data.get("produit_lavant_zone5"):
+            if zone5_start > zone4_start:
+                zone_separators.append(zone5_start - 1)
+            table_data.append(["PRODUITS LAVANT ZONE 5", format_value(facility_data.get("produit_lavant_zone5"))])
+            table_data.append(["DILUTION LAVANT ZONE 5", format_dilution(facility_data.get("dilution_lavant_zone5"))])
+            table_data.append(["COULEUR BUSE LAVANT ZONE 5", format_value(facility_data.get("couleur_buse_lavant_zone5"))])
+        
+        if facility_data.get("produit_sechant_zone5"):
+            table_data.append(["PRODUITS SÉCHANT ZONE 5", format_value(facility_data.get("produit_sechant_zone5"))])
+            table_data.append(["DILUTION SÉCHANT ZONE 5", format_dilution(facility_data.get("dilution_sechant_zone5"))])
+            table_data.append(["COULEUR BUSE SÉCHANT ZONE 5", format_value(facility_data.get("couleur_buse_sechant_zone5"))])
+        
+        if table_data:
+            # Tableau élargi avec colonnes définies
+            table = Table(table_data, colWidths=[10*cm, 14*cm])
+            table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+            
+            # Style de base
+            style_commands = [
+                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),  # En-tête (colonne gauche) gris neutre
+                ('TEXTCOLOR', (0, 0), (0, -1), colors.black),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                ('BACKGROUND', (1, 0), (1, -1), colors.white),  # Données (colonne droite) en blanc
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ]
+            
+            # Ajouter des lignes épaisses entre les zones
+            for separator_row in zone_separators:
+                if separator_row < len(table_data) - 1:
+                    style_commands.append(('LINEBELOW', (0, separator_row), (-1, separator_row), 2.5, colors.black))
+            
+            table.setStyle(TableStyle(style_commands))
+            
+            elements.append(table)
+            elements.append(Spacer(1, 0.5*cm))
+        
+        return elements
+    
+    def _create_daily_average_by_zone_table(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée les tableaux de consommation quotidienne moyenne par lavage - une page par zone"""
+        elements = []
+        
+        title_style = ParagraphStyle(
+            'DailyAverageTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        zone_style = ParagraphStyle(
+            'ZoneSubtitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=12,
+            alignment=TA_CENTER
+        )
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        # Convertir les dates
+        start_date = datetime.strptime(from_date, "%Y-%m-%d")
+        end_date = datetime.strptime(to_date, "%Y-%m-%d")
+        
+        products = facility_data.get("products", [])
+        zones = facility_data.get("zones", ["GLOBAL"])
+        
+        # Créer les tableaux pour toutes les zones sur la même page
+        elements.append(PageBreak())
+        # Spacer pour centrer verticalement le contenu
+        elements.append(Spacer(1, 1*cm))
+        
+        for zone_idx, zone in enumerate(zones):
+            # Filtrer les produits de cette zone
+            zone_products = [p for p in products if p.get("zone") == zone or (p.get("zone") is None and zone == "GLOBAL")]
+            
+            if not zone_products:
+                continue
+            
+            # Titre avec la zone (pas de PageBreak entre les zones)
+            elements.append(Paragraph(f"CONSOMMATION MENSUELLE TOTALE - JOUR PAR JOUR - {zone.upper()}", title_style))
+            elements.append(Spacer(1, 0.3*cm))
+            
+            # Première quinzaine (jours 1-15)
+            month_str = start_date.strftime("%m")
+            first_half_data = [["PRODUITS"] + [f"{d:02d}/{month_str}" for d in range(1, 16)]]
+            
+            for product in zone_products:
+                product_name = product.get("name", "")
+                daily_quantities = product.get("daily_quantities", [])
+                
+                # Mapper vers le nom Excel
+                excel_name = get_excel_product_name(product_name, facility_data)
+                # Utiliser Paragraph pour permettre le retour à la ligne
+                row = [Paragraph(excel_name.upper(), product_name_style)]
+                for day in range(1, 16):
+                    date_str = start_date.replace(day=day).strftime("%Y-%m-%d")
+                    qty_data = next((q for q in daily_quantities if q.get("date") == date_str), None)
+                    if qty_data:
+                        qty_raw = qty_data.get("qty", 0)
+                        qty_l = qty_raw / 10000
+                        row.append(f"{qty_l:.2f}L".replace('.', ','))
+                    else:
+                        row.append("-")
+                
+                first_half_data.append(row)
+            
+            if len(first_half_data) > 1:
+                available_width = 28.7*cm
+                product_col_width = 6*cm
+                col_width = (available_width - product_col_width) / 15
+                table = Table(first_half_data, colWidths=[product_col_width] + [col_width]*15)
+                table.hAlign = 'CENTER'
+                style_list = [
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 9),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ]
+                # Griser les week-ends avec un gris plus foncé
+                for day in range(1, 16):
+                    date_obj = start_date.replace(day=day)
+                    if date_obj.weekday() >= 5:
+                        col_index = day
+                        style_list.append(('BACKGROUND', (col_index, 1), (col_index, -1), colors.HexColor('#D3D3D3')))  # Gris plus foncé pour week-ends
+                table.setStyle(TableStyle(style_list))
+                elements.append(table)
+                elements.append(Spacer(1, 0.3*cm))
+                
+            # Deuxième quinzaine
+            if start_date.month == 12:
+                next_month = start_date.replace(year=start_date.year + 1, month=1, day=1)
+            else:
+                next_month = start_date.replace(month=start_date.month + 1, day=1)
+            last_day = (next_month - timedelta(days=1)).day
+            
+            second_half_data = [["PRODUITS"] + [f"{d:02d}/{start_date.strftime('%m')}" for d in range(16, last_day + 1)]]
+            
+            for product in zone_products:
+                product_name = product.get("name", "")
+                daily_quantities = product.get("daily_quantities", [])
+                
+                # Mapper vers le nom Excel
+                excel_name = get_excel_product_name(product_name, facility_data)
+                # Utiliser Paragraph pour permettre le retour à la ligne
+                row = [Paragraph(excel_name.upper(), product_name_style)]
+                for day in range(16, last_day + 1):
+                    try:
+                        date_str = start_date.replace(day=day).strftime("%Y-%m-%d")
+                        qty_data = next((q for q in daily_quantities if q.get("date") == date_str), None)
+                        if qty_data:
+                            qty_raw = qty_data.get("qty", 0)
+                            qty_l = qty_raw / 10000
+                            row.append(f"{qty_l:.2f}L".replace('.', ','))
+                        else:
+                            row.append("-")
+                    except ValueError:
+                        row.append("-")
+                
+                second_half_data.append(row)
+            
+            if len(second_half_data) > 1:
+                days_count = last_day - 15
+                available_width = 28.7*cm
+                product_col_width = 6*cm
+                col_width = (available_width - product_col_width) / days_count
+                table = Table(second_half_data, colWidths=[product_col_width] + [col_width]*days_count)
+                table.hAlign = 'CENTER'
+                style_list = [
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 9),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ]
+                # Griser les week-ends avec un gris plus foncé
+                for day in range(16, last_day + 1):
+                    try:
+                        date_obj = start_date.replace(day=day)
+                        if date_obj.weekday() >= 5:
+                            col_index = day - 15
+                            style_list.append(('BACKGROUND', (col_index, 1), (col_index, -1), colors.HexColor('#D3D3D3')))  # Gris plus foncé pour week-ends
+                    except ValueError:
+                        pass
+                table.setStyle(TableStyle(style_list))
+                elements.append(table)
+                elements.append(Spacer(1, 0.3*cm))
+                
+                # Texte explicatif pour les parties grisées (uniquement sous la 2ème partie)
+                explanation_style = ParagraphStyle(
+                    'TableExplanation',
+                    fontName='Helvetica',
+                    fontSize=8,
+                    alignment=TA_CENTER,
+                    textColor=colors.black
+                )
+                explanation = Paragraph("LES PARTIES GRISÉES CORRESPONDENT AUX WEEK-ENDS ET JOURS FÉRIÉS.", explanation_style)
+                elements.append(explanation)
+                elements.append(Spacer(1, 0.5*cm))
+        
+        return elements
+    
+    def _create_daily_consumption_tables(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée les tableaux de consommation jour par jour (quinzaines)"""
+        elements = []
+        
+        title_style = ParagraphStyle(
+            'TableTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        text_style = ParagraphStyle(
+            'TableText',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=10,
+            alignment=TA_LEFT,
+            leading=14
+        )
+        
+        elements.append(PageBreak())
+        # Spacer pour centrer verticalement le contenu (page A4 paysage ~21cm - marges)
+        elements.append(Spacer(1, 3*cm))
+        elements.append(Paragraph("CONSOMMATION MENSUELLE GLOBALE - TABLEAU JOUR PAR JOUR", title_style))
+        elements.append(Spacer(1, 0.5*cm))
+        
+        # Convertir les dates
+        start_date = datetime.strptime(from_date, "%Y-%m-%d")
+        end_date = datetime.strptime(to_date, "%Y-%m-%d")
+        
+        # Séparer en quinzaines
+        mid_month = start_date.replace(day=15)
+        
+        products = facility_data.get("products", [])
+        
+        # Première quinzaine (jours 1-15)
+        month_str = start_date.strftime("%m")
+        first_half_data = [["PRODUITS"] + [f"{d:02d}/{month_str}" for d in range(1, 16)]]
+        
+        # Regrouper les produits par nom (ignorer la zone)
+        import re
+        products_by_name_first = {}
+        for product in products:
+            product_name_full = product.get("name", "")
+            # Extraire le nom sans la zone (retirer " - ZONE X")
+            product_name = re.sub(r'\s*-\s*ZONE\s+\d+\s*$', '', product_name_full, flags=re.IGNORECASE).strip()
+            daily_quantities = product.get("daily_quantities", [])
+            
+            if product_name not in products_by_name_first:
+                products_by_name_first[product_name] = {}
+            
+            # Additionner les quantités pour chaque jour
+            for day in range(1, 16):
+                date_str = start_date.replace(day=day).strftime("%Y-%m-%d")
+                qty_data = next((q for q in daily_quantities if q.get("date") == date_str), None)
+                if qty_data:
+                    qty_raw = qty_data.get("qty", 0)
+                    qty_l = qty_raw / 10000
+                    if day not in products_by_name_first[product_name]:
+                        products_by_name_first[product_name][day] = 0
+                    products_by_name_first[product_name][day] += qty_l
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        # Créer les lignes du tableau
+        for product_name, daily_data in products_by_name_first.items():
+            # Mapper vers le nom Excel
+            excel_name = get_excel_product_name(product_name, facility_data)
+            # Utiliser Paragraph pour permettre le retour à la ligne
+            row = [Paragraph(excel_name.upper(), product_name_style)]
+            for day in range(1, 16):
+                if day in daily_data:
+                    qty_l = daily_data[day]
+                    row.append(f"{qty_l:.2f}L".replace('.', ','))
+                else:
+                    row.append("-")
+            first_half_data.append(row)
+        
+        if len(first_half_data) > 1:
+            # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+            available_width = 28.7*cm
+            product_col_width = 6*cm
+            col_width = (available_width - product_col_width) / 15  # Reste divisé par 15 jours
+            table = Table(first_half_data, colWidths=[product_col_width] + [col_width]*15)
+            table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+            style_list = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ]
+            # Griser les week-ends avec un gris plus foncé
+            for day in range(1, 16):
+                date_obj = start_date.replace(day=day)
+                if date_obj.weekday() >= 5:  # 5=samedi, 6=dimanche
+                    col_index = day  # colonne = jour (car colonne 0 = nom produit)
+                    style_list.append(('BACKGROUND', (col_index, 1), (col_index, -1), colors.HexColor('#D3D3D3')))  # Gris plus foncé pour week-ends
+            table.setStyle(TableStyle(style_list))
+            elements.append(table)
+            elements.append(Spacer(1, 0.3*cm))
+        
+        # Deuxième quinzaine (jours 16-fin du mois)
+        # Calculer le dernier jour du mois
+        if start_date.month == 12:
+            next_month = start_date.replace(year=start_date.year + 1, month=1, day=1)
+        else:
+            next_month = start_date.replace(month=start_date.month + 1, day=1)
+        last_day = (next_month - timedelta(days=1)).day
+        
+        second_half_data = [["PRODUITS"] + [f"{d:02d}/{start_date.strftime('%m')}" for d in range(16, last_day + 1)]]
+        
+        # Regrouper les produits par nom (ignorer la zone)
+        products_by_name_second = {}
+        for product in products:
+            product_name_full = product.get("name", "")
+            # Extraire le nom sans la zone (retirer " - ZONE X")
+            product_name = re.sub(r'\s*-\s*ZONE\s+\d+\s*$', '', product_name_full, flags=re.IGNORECASE).strip()
+            daily_quantities = product.get("daily_quantities", [])
+            
+            if product_name not in products_by_name_second:
+                products_by_name_second[product_name] = {}
+            
+            # Additionner les quantités pour chaque jour
+            for day in range(16, last_day + 1):
+                try:
+                    date_str = start_date.replace(day=day).strftime("%Y-%m-%d")
+                    qty_data = next((q for q in daily_quantities if q.get("date") == date_str), None)
+                    if qty_data:
+                        qty_raw = qty_data.get("qty", 0)
+                        qty_l = qty_raw / 10000
+                        if day not in products_by_name_second[product_name]:
+                            products_by_name_second[product_name][day] = 0
+                        products_by_name_second[product_name][day] += qty_l
+                except ValueError:
+                    pass
+        
+        # Créer les lignes du tableau
+        for product_name, daily_data in products_by_name_second.items():
+            # Mapper vers le nom Excel
+            excel_name = get_excel_product_name(product_name, facility_data)
+            # Utiliser Paragraph pour permettre le retour à la ligne
+            row = [Paragraph(excel_name.upper(), product_name_style)]
+            for day in range(16, last_day + 1):
+                if day in daily_data:
+                    qty_l = daily_data[day]
+                    row.append(f"{qty_l:.2f}L".replace('.', ','))
+                else:
+                    row.append("-")
+            second_half_data.append(row)
+        
+        if len(second_half_data) > 1:
+            days_count = last_day - 15
+            # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+            available_width = 28.7*cm
+            product_col_width = 6*cm
+            col_width = (available_width - product_col_width) / days_count
+            table = Table(second_half_data, colWidths=[product_col_width] + [col_width]*days_count)
+            table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+            style_list = [
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ]
+            # Griser les week-ends avec un gris plus foncé
+            for day in range(16, last_day + 1):
+                try:
+                    date_obj = start_date.replace(day=day)
+                    if date_obj.weekday() >= 5:  # 5=samedi, 6=dimanche
+                        col_index = day - 15  # colonne relative à la deuxième quinzaine
+                        style_list.append(('BACKGROUND', (col_index, 1), (col_index, -1), colors.HexColor('#D3D3D3')))  # Gris plus foncé pour week-ends
+                except ValueError:
+                    pass
+            table.setStyle(TableStyle(style_list))
+            elements.append(table)
+            elements.append(Spacer(1, 0.3*cm))
+            
+            # Texte explicatif pour les parties grisées (uniquement sous la 2ème partie)
+            explanation_style = ParagraphStyle(
+                'TableExplanation',
+                fontName='Helvetica',
+                fontSize=8,
+                alignment=TA_CENTER,
+                textColor=colors.black
+            )
+            explanation = Paragraph("LES PARTIES GRISÉES CORRESPONDENT AUX WEEK-ENDS ET JOURS FÉRIÉS.", explanation_style)
+            elements.append(explanation)
+            elements.append(Spacer(1, 0.5*cm))
+        
+        return elements
+    
+    def _create_daily_total_by_zone_table(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée le tableau de consommation quotidienne totale par produits - une page par zone"""
+        elements = []
+        
+        title_style = ParagraphStyle(
+            'DailyTotalTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        zone_style = ParagraphStyle(
+            'ZoneSubtitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=12,
+            alignment=TA_CENTER
+        )
+        
+        text_style = ParagraphStyle(
+            'ExplanationText',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=10,
+            alignment=TA_LEFT,
+            leading=14
+        )
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        products = facility_data.get("products", [])
+        zones = facility_data.get("zones", ["GLOBAL"])
+        
+        # Créer les tableaux pour toutes les zones sur la même page
+        elements.append(PageBreak())
+        # Spacer pour centrer verticalement le contenu
+        elements.append(Spacer(1, 2*cm))
+        
+        for zone_idx, zone in enumerate(zones):
+            # Filtrer les produits de cette zone
+            zone_products = [p for p in products if p.get("zone") == zone or (p.get("zone") is None and zone == "GLOBAL")]
+            
+            if not zone_products:
+                continue
+            
+            # Titre avec la zone (pas de PageBreak entre les zones)
+            elements.append(Paragraph(f"CONSOMMATION TOTALE MENSUELLE - {zone.upper()}", title_style))
+            elements.append(Spacer(1, 0.3*cm))
+            
+            # Récupérer les données mensuelles pour cette zone
+            # Générer les en-têtes pour l'année en cours uniquement (janvier à décembre)
+            end_date = datetime.strptime(to_date, "%Y-%m-%d")
+            current_year = end_date.year
+            current_month = end_date.month
+            
+            # Mois de janvier à décembre de l'année en cours
+            month_headers = []
+            months_list = []  # Liste des (year, month) pour la recherche
+            for month in range(1, 13):
+                month_headers.append(f"{month:02d}/{str(current_year)[-2:]}")
+                months_list.append((current_year, month))
+            
+            table_data = [["PRODUITS"] + month_headers]
+            
+            # Pas de regroupement ici - garder les produits avec leurs zones
+            for product in zone_products:
+                product_name = product.get("name", "")
+                monthly_quantities = product.get("monthly_quantities", [])
+                
+                # Mapper vers le nom Excel
+                excel_name = get_excel_product_name(product_name, facility_data)
+                # Utiliser Paragraph pour permettre le retour à la ligne
+                row = [Paragraph(excel_name.upper(), product_name_style)]
+                
+                # Chercher les données pour chaque mois de l'année en cours
+                for year, month in months_list:
+                    # Si le mois est dans le futur, laisser la case vide
+                    if month > current_month:
+                        row.append("")
+                        continue
+                    month_data = next((m for m in monthly_quantities if m.get("year") == year and m.get("month") == month), None)
+                    if month_data:
+                        qty_raw = month_data.get("qty", 0)
+                        # Convertir en litres (diviser par 10000)
+                        qty_l = qty_raw / 10000
+                        row.append(f"{qty_l:.2f}L".replace('.', ','))
+                    else:
+                        row.append("-")
+                
+                table_data.append(row)
+            
+            if len(table_data) > 1:
+                # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+                available_width = 28.7*cm
+                product_col_width = 6*cm
+                col_width = (available_width - product_col_width) / 12  # Reste divisé par 12 mois
+                table = Table(table_data, colWidths=[product_col_width] + [col_width]*12)
+                table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 9),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ]))
+                elements.append(table)
+                elements.append(Spacer(1, 0.5*cm))  # Espace entre les tableaux de zones
+        
+        return elements
+    
+    def _create_monthly_consumption_table(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée le tableau de consommation globale mensuelle"""
+        elements = []
+        
+        title_style = ParagraphStyle(
+            'MonthlyTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        text_style = ParagraphStyle(
+            'ExplanationText',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=10,
+            alignment=TA_LEFT,
+            leading=14
+        )
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        elements.append(PageBreak())
+        # Spacer pour centrer verticalement le contenu
+        elements.append(Spacer(1, 3*cm))
+        elements.append(Paragraph("CONSOMMATION GLOBALE MENSUELLE", title_style))
+        elements.append(Spacer(1, 0.5*cm))
+        
+        products = facility_data.get("products", [])
+        facility_id = facility_data.get("facility_id")
+
+        # Récupérer les données mensuelles
+        # Générer les en-têtes pour l'année en cours uniquement (janvier à décembre)
+        end_date = datetime.strptime(to_date, "%Y-%m-%d")
+        current_year = end_date.year
+        current_month = end_date.month
+        
+        # Mois de janvier à décembre de l'année en cours
+        month_headers = []
+        months_list = []  # Liste des (year, month) pour la recherche
+        for month in range(1, 13):
+            month_headers.append(f"{month:02d}/{str(current_year)[-2:]}")
+            months_list.append((current_year, month))
+        
+        table_data = [["PRODUITS"] + month_headers]
+        
+        # Regrouper les produits par nom (ignorer la zone)
+        import re
+        products_by_name = {}
+        for product in products:
+            product_name_full = product.get("name", "")
+            # Extraire le nom sans la zone (retirer " - ZONE X")
+            product_name = re.sub(r'\s*-\s*ZONE\s+\d+\s*$', '', product_name_full, flags=re.IGNORECASE).strip()
+            # Nom canonique pour les sites au nommage non standard (regroupe les
+            # alias comme "Auto sech..."). Sans effet sur les autres sites.
+            product_name = canonical_product_name(facility_id, product_name)
+            monthly_quantities = product.get("monthly_quantities", [])
+
+            if product_name not in products_by_name:
+                products_by_name[product_name] = {}
+            
+            # Additionner les quantités pour chaque mois
+            for month_data in monthly_quantities:
+                year = month_data.get("year")
+                month = month_data.get("month")
+                qty_raw = month_data.get("qty", 0)
+                if year and month:
+                    key = (year, month)
+                    if key not in products_by_name[product_name]:
+                        products_by_name[product_name][key] = 0
+                    # Convertir en litres (diviser par 10000)
+                    qty_l = qty_raw / 10000
+                    products_by_name[product_name][key] += qty_l
+        
+        # Créer les lignes du tableau
+        # Memoriser l'ordre des lignes pour aligner le tableau PRODUITS LIVRES dessus
+        self._monthly_table_order = []
+        for product_name, monthly_data in products_by_name.items():
+            # Mapper vers le nom Excel
+            excel_name = get_excel_product_name(product_name, facility_data)
+            # Extraire le code produit en fin de nom Excel (ex: "... 200L - 08904711")
+            code_match = re.search(r'(\d{6,})\s*$', excel_name)
+            self._monthly_table_order.append({
+                "code": code_match.group(1) if code_match else "",
+                "norm": normalize_product_name(excel_name),
+            })
+            # Utiliser Paragraph pour permettre le retour à la ligne
+            row = [Paragraph(excel_name.upper(), product_name_style)]
+            
+            # Chercher les données pour chaque mois de l'année en cours
+            for year, month in months_list:
+                key = (year, month)
+                # Si le mois est dans le futur, laisser la case vide
+                if month > current_month:
+                    row.append("")
+                elif key in monthly_data:
+                    qty_l = monthly_data[key]
+                    row.append(f"{qty_l:.2f}L".replace('.', ','))
+                else:
+                    row.append("-")
+            
+            table_data.append(row)
+        
+        if len(table_data) > 1:
+            # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+            available_width = 28.7*cm
+            product_col_width = 6*cm
+            col_width = (available_width - product_col_width) / 12  # Reste divisé par 12 mois
+            table = Table(table_data, colWidths=[product_col_width] + [col_width]*12)
+            table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ]))
+            elements.append(table)
+        
+        return elements
+    
+    def _create_delivered_products_table(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée le tableau des produits livrés à partir des données Odoo"""
+        elements = []
+        
+        title_style = ParagraphStyle(
+            'DeliveredTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        # Style pour les noms de produits (permet le retour à la ligne)
+        product_name_style = ParagraphStyle(
+            'ProductName',
+            fontName='Helvetica',
+            fontSize=8,
+            leading=9,
+            alignment=TA_LEFT
+        )
+        
+        # Pas de PageBreak - on reste sur la même page que CONSOMMATION GLOBALE MENSUELLE
+        elements.append(Spacer(1, 1*cm))
+        elements.append(Paragraph("PRODUITS LIVRÉS", title_style))
+        elements.append(Spacer(1, 0.5*cm))
+        
+        # Générer les en-têtes pour l'année en cours uniquement (janvier à décembre)
+        end_date = datetime.strptime(to_date, "%Y-%m-%d")
+        current_year = end_date.year
+        # Utiliser le mois de la date de fin du rapport (to_date) comme limite
+        report_end_month = end_date.month
+        
+        # Mois de janvier à décembre de l'année en cours
+        month_headers = []
+        for month in range(1, 13):
+            month_headers.append(f"{month:02d}/{str(current_year)[-2:]}")
+        
+        # Créer un tableau avec les produits livrés depuis Odoo
+        table_data = [["PRODUITS"] + month_headers]
+        
+        # Récupérer les données Odoo (nouvelle structure)
+        odoo_data = facility_data.get("odoo_delivered_products", {})
+        
+        # Utiliser products_by_month directement depuis le cache (déjà agrégé)
+        products_by_month_raw = odoo_data.get("products_by_month", {})
+        
+        # Fonction pour extraire la référence produit (numéro entre crochets)
+        def extract_product_ref(name: str) -> str:
+            """Extrait la référence produit (ex: [0893025650073] -> 0893025650073)"""
+            if not name:
+                return ""
+            match = re.search(r'\[(\d+)\]', name)
+            if match:
+                return match.group(1)
+            return ""
+        
+        def clean_product_name(name: str) -> str:
+            """Nettoie le nom du produit pour l'affichage"""
+            if not name:
+                return ""
+            name = name.replace('\n', ' ').replace('\r', ' ')
+            name = re.sub(r'\s+', ' ', name)
+            return name.strip().upper()
+        
+        # Convertir les clés de mois "YYYY-MM" en numéro de mois
+        # Regrouper par RÉFÉRENCE PRODUIT (numéro), garder le premier nom rencontré
+        products_by_ref = {}  # {ref: {"name": first_name, "months": {month_int: qty}}}
+        
+        for product_name, months_data in products_by_month_raw.items():
+            # Extraire la référence produit
+            ref = extract_product_ref(product_name)
+            if not ref:
+                # Si pas de référence, utiliser le nom nettoyé comme clé
+                ref = clean_product_name(product_name)
+            if not ref:
+                continue
+            
+            # Initialiser si nécessaire, garder le premier nom rencontré
+            if ref not in products_by_ref:
+                products_by_ref[ref] = {
+                    "name": clean_product_name(product_name),
+                    "months": {}
+                }
+            
+            for month_key, qty in months_data.items():
+                try:
+                    # month_key est au format "YYYY-MM"
+                    year_str, month_str = month_key.split("-")
+                    if int(year_str) == current_year:
+                        month_int = int(month_str)
+                        # Ne garder que les mois jusqu'à la date de fin du rapport
+                        if month_int <= report_end_month:
+                            # Additionner les quantités si le mois existe déjà
+                            if month_int in products_by_ref[ref]["months"]:
+                                products_by_ref[ref]["months"][month_int] += qty
+                            else:
+                                products_by_ref[ref]["months"][month_int] = qty
+                except:
+                    continue
+        
+        # Supprimer les produits sans données pour l'année en cours
+        products_by_ref = {k: v for k, v in products_by_ref.items() if v["months"]}
+        
+        # Convertir en format pour l'affichage: {display_name: {month: qty, "_ref": ref}}
+        products_by_month = {}
+        display_refs = {}
+        for ref, data in products_by_ref.items():
+            products_by_month[data["name"]] = data["months"]
+            display_refs[data["name"]] = ref
+
+        def order_key(display_name: str):
+            """Aligne l'ordre sur le tableau CONSOMMATION GLOBALE MENSUELLE.
+            Matching par code produit (ref Odoo commence par le code Excel),
+            sinon par mots-cles (WNC n°, SECHANT, JANTES/PURPLE, MOUSSE),
+            sinon en fin de tableau par ordre alphabetique."""
+            order = getattr(self, "_monthly_table_order", [])
+            ref = display_refs.get(display_name, "")
+            norm = normalize_product_name(display_name)
+            wnc = re.search(r'WNC(\d+)', norm)
+            for idx, entry in enumerate(order):
+                code = entry.get("code", "")
+                if code and ref and (ref.startswith(code) or code.startswith(ref)):
+                    return (0, idx, display_name)
+            for idx, entry in enumerate(order):
+                enorm = entry.get("norm", "")
+                ewnc = re.search(r'WNC(\d+)', enorm)
+                if wnc and ewnc and wnc.group(1) == ewnc.group(1):
+                    return (0, idx, display_name)
+                if "SECHANT" in norm and "SECHANT" in enorm:
+                    return (0, idx, display_name)
+                if ("JANTE" in norm or "PURPLE" in norm) and ("JANTE" in enorm or "PURPLE" in enorm):
+                    return (0, idx, display_name)
+                if "MOUSSE" in norm and "MOUSSE" in enorm:
+                    return (0, idx, display_name)
+            return (1, 0, display_name)
+
+        # Créer les lignes du tableau
+        if products_by_month:
+            for product_name in sorted(products_by_month.keys(), key=order_key):
+                monthly_data = products_by_month[product_name]
+                row = [Paragraph(product_name, product_name_style)]
+                
+                for month in range(1, 13):
+                    if month in monthly_data:
+                        qty = monthly_data[month]
+                        # Afficher la quantité (entier si pas de décimales)
+                        if qty == int(qty):
+                            row.append(str(int(qty)))
+                        else:
+                            row.append(f"{qty:.1f}")
+                    elif month > report_end_month:
+                        row.append("")  # Mois après la date de fin du rapport = case vide
+                    else:
+                        row.append("-")  # Mois passé sans livraison
+                
+                table_data.append(row)
+        else:
+            # Aucune donnée Odoo disponible
+            example_row = [Paragraph("AUCUNE LIVRAISON", product_name_style)]
+            for month in range(1, 13):
+                if month > report_end_month:
+                    example_row.append("")
+                else:
+                    example_row.append("-")
+            table_data.append(example_row)
+        
+        # Utiliser la largeur maximale disponible (A4 landscape = 29.7cm - marges 1cm = 28.7cm)
+        available_width = 28.7*cm
+        product_col_width = 6*cm
+        col_width = (available_width - product_col_width) / 12  # Reste divisé par 12 mois
+        table = Table(table_data, colWidths=[product_col_width] + [col_width]*12)
+        table.hAlign = 'CENTER'  # Centrer le tableau sur la page
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),  # En-tête gris neutre
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),  # Données en blanc
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+        ]))
+        elements.append(table)
+        
+        return elements
+    
+    def _draw_first_page(self, canvas, doc):
+        """Dessine les logos et le footer pour la première page"""
+        # Dessiner les logos normalement
+        self._draw_logo(canvas, doc)
+        
+        # Dessiner le footer en position absolue en bas de page
+        canvas.saveState()
+        page_width, page_height = doc.pagesize
+        
+        # Texte du footer
+        footer_text1 = "EN CAS DE PANNE SUR LE SYSTÈME VENTURI, CONTACTEZ LE SUPPORT TECHNIQUE AU 03 88 64 72 10."
+        
+        # Position du footer : 1.0cm du bas de la page
+        y_position = 1.0*cm
+        
+        # Première ligne en noir
+        canvas.setFont('Helvetica', 8)
+        canvas.setFillColor(colors.black)
+        canvas.drawCentredString(page_width / 2, y_position + 0.4*cm, footer_text1)
+        
+        # Deuxième ligne avec email en bleu
+        footer_text2_part1 = "UNE QUESTION SUR VOTRE CONTRAT ? CONTACTEZ NOTRE SUPPORT ADMINISTRATIF AU 03 88 64 85 79 OU PAR MAIL "
+        footer_email = "SYSTEMES.SOLUTIONS@WURTH.FR"
+        
+        # Calculer les largeurs pour centrer correctement
+        text_width_part1 = canvas.stringWidth(footer_text2_part1, 'Helvetica', 8)
+        text_width_email = canvas.stringWidth(footer_email, 'Helvetica', 8)
+        total_width = text_width_part1 + text_width_email
+        
+        # Position de départ pour centrer le tout
+        start_x = (page_width - total_width) / 2
+        
+        # Dessiner la première partie en noir
+        canvas.setFillColor(colors.black)
+        canvas.drawString(start_x, y_position, footer_text2_part1)
+        
+        # Dessiner l'email en bleu
+        canvas.setFillColor(colors.blue)
+        canvas.drawString(start_x + text_width_part1, y_position, footer_email)
+        
+        canvas.restoreState()
+    
+    def _draw_logo(self, canvas, doc):
+        """Dessine les logos Würth (gauche) et TMH (droite) en haut de chaque page"""
+        canvas.saveState()
+        
+        page_width, page_height = doc.pagesize
+        
+        # Logo Würth à gauche
+        wurth_logo_path = self.base_dir / "images" / "Würth_logo.png"
+        if wurth_logo_path.exists():
+            try:
+                with PILImage.open(wurth_logo_path) as img:
+                    img_width, img_height = img.size
+                    ratio = img_height / img_width
+                
+                logo_width = 4.5*cm
+                logo_height = logo_width * ratio
+                
+                x = 0.8*cm
+                y = page_height - logo_height - 0.8*cm
+                
+                canvas.drawImage(str(wurth_logo_path), x, y, width=logo_width, height=logo_height, preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                print(f"Erreur lors du chargement du logo Würth: {e}")
+        
+        # Logo TMH au centre
+        tmh_logo_path = self.base_dir / "images" / "Logo - Solution de lavage connecté.png"
+        if tmh_logo_path.exists():
+            try:
+                with PILImage.open(tmh_logo_path) as img:
+                    img_width, img_height = img.size
+                    ratio = img_height / img_width
+                
+                logo_width = 12*cm
+                logo_height = logo_width * ratio
+                
+                x = (page_width - logo_width) / 2
+                y = page_height - logo_height - 0.7*cm
+                
+                canvas.drawImage(str(tmh_logo_path), x, y, width=logo_width, height=logo_height, preserveAspectRatio=True, mask='auto')
+            except Exception as e:
+                print(f"Erreur lors du chargement du logo TMH: {e}")
+        
+        canvas.restoreState()
+    
+    def _create_flowrate_pages(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée les pages de débit moyen par zone"""
+        from .consumption_charts import ConsumptionChartGenerator
+        
+        elements = []
+        chart_gen = ConsumptionChartGenerator()
+        
+        title_style = ParagraphStyle(
+            'FlowrateTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        text_style = ParagraphStyle(
+            'FlowrateText',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=10,
+            alignment=TA_LEFT,
+            leading=14
+        )
+        
+        # Récupérer les données flowrate
+        flowrate_data = facility_data.get("flowrate_data", {})
+        
+        if not flowrate_data:
+            # Pas de données flowrate, ne rien générer
+            return elements
+        
+        # Récupérer les zones
+        zones = facility_data.get("zones", ["GLOBAL"])
+        
+        # Regrouper TOUTES les données flowrate de tous les devices
+        all_events = {"data": {"results": []}}
+        for device_id, events_data in flowrate_data.items():
+            if isinstance(events_data, dict):
+                data = events_data.get("data")
+                if isinstance(data, dict) and "results" in data:
+                    all_events["data"]["results"].extend(data["results"])
+                elif isinstance(data, list):
+                    all_events["data"]["results"].extend(data)
+        
+        if not all_events["data"]["results"]:
+            return elements
+        
+        explanation_style = ParagraphStyle(
+            'FlowrateExplanation',
+            fontName='Helvetica',
+            fontSize=8,
+            alignment=TA_LEFT,
+            textColor=colors.black
+        )
+        detailed_explanation = (
+            "LES PARTIES GRISÉES CORRESPONDENT AUX WEEK-ENDS ET JOURS FÉRIÉS.<br/>"
+            "LES CONSOMMATIONS SONT EXPRIMÉES EN ML PAR UTILISATION DANS LA JOURNÉE. "
+            "EXEMPLE : UN POINT À 200 ML SIGNIFIE QU'IL A FALLU EN MOYENNE 200 ML POUR LAVER CHAQUE VOITURE DANS LA JOURNÉE"
+        )
+
+        def add_flowrate_page(chart_buf, zone, page_title):
+            elements.append(PageBreak())
+            elements.append(Paragraph(page_title, title_style))
+            elements.append(Spacer(1, 0.3*cm))
+            explanation_text = f"GRAPHIQUE DE DÉBIT POUR LA <b>{zone.upper()}</b>"
+            elements.append(Paragraph(explanation_text, text_style))
+            elements.append(Spacer(1, 0.5*cm))
+            img = Image(chart_buf, width=24*cm, height=12*cm)
+            img.hAlign = 'CENTER'
+            elements.append(img)
+            elements.append(Spacer(1, 0.3*cm))
+            elements.append(Paragraph(detailed_explanation, explanation_style))
+            elements.append(Spacer(1, 0.5*cm))
+
+        # Créer une page par zone - le filtrage par produit se fait dans create_flowrate_chart
+        # Dissocier l'eau des autres produits : la consommation d'eau ecrase l'echelle
+        # et masque le debit reel des produits chimiques
+        facility_id = facility_data.get("facility_id")
+        # Le flowrate CM2W de certains sites non standards a des noms de produits
+        # incoherents (produit parfois renomme -> tag de zone perdu). Un decoupage
+        # par zone y ferait disparaitre les produits sans tag. On reste donc en GLOBAL
+        # pour ces sites (les graphiques de CONSOMMATION, eux, restent bien zones).
+        flowrate_zones = ["GLOBAL"] if site_has_overrides(facility_id) else zones
+        for zone in flowrate_zones:
+            products_chart_buf = chart_gen.create_flowrate_chart(
+                all_events, "", zone, from_date, to_date, water_filter=False, facility_id=facility_id
+            )
+            water_chart_buf = chart_gen.create_flowrate_chart(
+                all_events, "", zone, from_date, to_date, water_filter=True, facility_id=facility_id
+            )
+
+            if products_chart_buf:
+                add_flowrate_page(products_chart_buf, zone, "DÉBIT MOYEN JOURNALIER")
+            if water_chart_buf:
+                add_flowrate_page(water_chart_buf, zone, "DÉBIT MOYEN JOURNALIER - EAU")
+
+        return elements
+    
+    def _create_consumption_pages(self, facility_data: dict, from_date: str, to_date: str, styles):
+        """Crée les pages de suivi de consommation par zone"""
+        from .consumption_charts import ConsumptionChartGenerator
+        
+        elements = []
+        chart_gen = ConsumptionChartGenerator()
+        
+        title_style = ParagraphStyle(
+            'ConsumptionTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=14,
+            alignment=TA_CENTER
+        )
+        
+        text_style = ParagraphStyle(
+            'ConsumptionText',
+            parent=styles['Normal'],
+            fontName='Helvetica',
+            fontSize=10,
+            alignment=TA_LEFT,
+            leading=14
+        )
+        
+        zones = facility_data.get("zones", ["GLOBAL"])
+        products = facility_data.get("products", [])
+        facility_id = facility_data.get("facility_id")
+
+        explanation_style = ParagraphStyle(
+            'ChartExplanation',
+            fontName='Helvetica',
+            fontSize=8,
+            alignment=TA_LEFT,
+            textColor=colors.black
+        )
+        legend_text = "LES PARTIES GRISÉES CORRESPONDENT AUX WEEK-ENDS ET JOURS FÉRIÉS.<br/>LES CONSOMMATIONS SONT EXPRIMÉES EN LITRES. LE GRAPHIQUE VOUS PERMET DE SUIVRE LES PICS D'ACTIVITÉ SUR LE MOIS."
+
+        def is_water_product(name: str) -> bool:
+            """Detecte les produits 'eau' (meme regle que facility_service)"""
+            return normalize_product_name(name).startswith("EAU")
+
+        def add_chart_page(chart_products, zone, section_title):
+            """Ajoute une page titre + graphique multi-produits + legende"""
+            elements.append(PageBreak())
+            elements.append(Paragraph(section_title, title_style))
+            elements.append(Spacer(1, 0.5*cm))
+            elements.append(Paragraph(
+                f"<b>ZONE:</b> {zone.upper()} | <b>PRODUITS:</b> {len(chart_products)} PRODUIT(S)",
+                text_style
+            ))
+            elements.append(Spacer(1, 0.3*cm))
+
+            chart_buffer = chart_gen.create_multi_product_chart(
+                chart_products, zone, from_date, to_date
+            )
+            elements.append(Image(chart_buffer, width=24*cm, height=12*cm))
+            elements.append(Spacer(1, 0.3*cm))
+            elements.append(Paragraph(legend_text, explanation_style))
+            elements.append(Spacer(1, 0.5*cm))
+
+        # Grouper par zone : un graphique par zone avec tous les produits
+        for zone in zones:
+            zone_products = [p for p in products if p.get("zone") == zone or (p.get("zone") is None and zone == "GLOBAL")]
+
+            if not zone_products:
+                continue
+
+            # Préparer les données pour le graphique multi-produits
+            products_data = []
+            for product in zone_products:
+                daily_quantities = product.get("daily_quantities", [])
+                if daily_quantities:
+                    products_data.append({
+                        "name": product.get("name", "PRODUITS INCONNUS"),
+                        "daily_data": daily_quantities
+                    })
+
+            if not products_data:
+                continue
+
+            # Regrouper les produits au nom canonique identique (sites au nommage
+            # CM2W non standard uniquement : doublons au nom identique, alias
+            # "Auto sech..."). Sans effet sur les autres sites.
+            products_data = merge_products_by_canonical(facility_id, products_data)
+
+            # Dissocier l'eau des autres produits : la consommation d'eau ecrase
+            # l'echelle et masque la consommation reelle des produits chimiques
+            water_data = [p for p in products_data if is_water_product(p.get("name", ""))]
+            other_data = [p for p in products_data if not is_water_product(p.get("name", ""))]
+
+            if other_data:
+                add_chart_page(
+                    other_data, zone,
+                    "SUIVI DE LA CONSOMMATION QUOTIDIENNE TOTALE PAR PRODUITS"
+                )
+            if water_data:
+                add_chart_page(
+                    water_data, zone,
+                    "SUIVI DE LA CONSOMMATION QUOTIDIENNE D'EAU"
+                )
+
+        return elements
